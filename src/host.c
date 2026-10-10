@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static const pad_output k_player_colours[HOST_MAX_PADS] = {
     { 0, 0, 0x00, 0x00, 0x40, 1, 0 },      /* blue */
@@ -1047,7 +1048,8 @@ static void on_event(host_t *h, const unsigned char *ev, int len)
             log_line("inquiry: controller answered status %#04x", ev[2]);
             if (ev[2] != 0) h->inquiring = 0;
         }
-        if (len >= 6 && le16(ev + 4) == 0x200D) {      /* LE Create Connection: le.c */
+        if (len >= 6 && (le16(ev + 4) == 0x200D ||    /* LE Create Connection: le.c */
+                         le16(ev + 4) == 0x2043)) {   /* its extended form */
             le_on_create_status(h, ev[2]);
             break;
         }
@@ -1252,6 +1254,14 @@ static void start_inquiry(host_t *h)
 {
     /* General inquiry, ~10 s, unlimited responses. */
     static const unsigned char inq[5] = { 0x33, 0x8B, 0x9E, 0x08, 0x00 };
+
+    /* Diagnostics: /data/padbridge/le_only skips the Classic search, to see
+     * whether this chip refuses an LE scan while an inquiry runs. */
+    if (access("/data/padbridge/le_only", F_OK) == 0) {
+        static int said;
+        if (!said++) log_line("diag: le_only -- no Classic inquiry");
+        return;
+    }
 
     if (send_cmd(h, OP_INQUIRY, inq, 5)) {
         h->inquiring = 1;

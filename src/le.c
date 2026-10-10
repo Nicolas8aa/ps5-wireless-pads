@@ -35,6 +35,34 @@
 #define OP_LE_START_ENCRYPTION   0x2019
 #define OP_LE_READ_LOCAL_P256    0x2025
 #define OP_LE_GENERATE_DHKEY     0x2026
+#define OP_LE_SET_EXT_SCAN_PARAMS 0x2041
+#define OP_LE_SET_EXT_SCAN_ENABLE 0x2042
+#define OP_LE_EXT_CREATE_CONN     0x2043
+
+/* Extended scanning and connecting (Bluetooth 5), chosen by the file
+ * /data/padbridge/le_ext. On a PS5 on firmware 13.60 the legacy LE scan is
+ * accepted but delivers no advertising reports at all; if the system's own
+ * driver uses the extended commands on this controller, the legacy ones are
+ * refused or silent and reports only come in the extended form. */
+static int g_ext = -1;
+
+static int le_ext(void)
+{
+    if (g_ext < 0) g_ext = access("/data/padbridge/le_ext", F_OK) == 0;
+    return g_ext;
+}
+
+/* Scan on or off in whichever form is in use. */
+static int scan_cmd(host_t *h, int on, int sync)
+{
+    uint8_t p[6] = { (uint8_t)on, 0, 0, 0, 0, 0 };
+
+    if (le_ext())
+        return sync ? hci_sync(h, OP_LE_SET_EXT_SCAN_ENABLE, p, 6)
+                    : send_cmd(h, OP_LE_SET_EXT_SCAN_ENABLE, p, 6);
+    return sync ? hci_sync(h, OP_LE_SET_SCAN_ENABLE, p, 2)
+                : send_cmd(h, OP_LE_SET_SCAN_ENABLE, p, 2);
+}
 
 #define CID_ATT     0x0004
 #define CID_LE_SIG  0x0005
@@ -177,7 +205,7 @@ void le_setup(host_t *h)
     /* LE events: connection complete, advertising report, connection
      * update, remote features, LTK request, ..., P-256 key, DHKey,
      * enhanced connection complete. */
-    static const uint8_t mask[8] = { 0xFF, 0x03, 0, 0, 0, 0, 0, 0 };
+    static const uint8_t mask[8] = { 0xFF, 0x13, 0, 0, 0, 0, 0, 0 };   /* + 0x0D */
     /* Active scanning (names come in scan responses), 60 ms every 60 ms. */
     static const uint8_t scan[7] = { 0x01, 0x60, 0x00, 0x60, 0x00, 0x00, 0x00 };
 
@@ -194,7 +222,18 @@ void le_setup(host_t *h)
         h->lep.credits = h->lep.max = h->cc[8];
         log_line("le: %d LE buffers of %u bytes", h->lep.max, h->le_mtu);
     }
-    hci_sync(h, OP_LE_SET_SCAN_PARAMS, scan, 7);
+    if (le_ext()) {
+        /* Public address, accept all, 1M PHY: active, 60 ms every 60 ms. */
+        static const uint8_t ext[8] = { 0x00, 0x00, 0x01, 0x01, 0x60, 0x00, 0x60, 0x00 };
+        int ok = hci_sync(h, OP_LE_SET_EXT_SCAN_PARAMS, ext, 8);
+        log_line("diag: extended LE scan parameters -> %s (status %#04x)",
+                 ok ? "accepted" : "refused", h->cc_op == OP_LE_SET_EXT_SCAN_PARAMS &&
+                 h->cc_len > 5 ? h->cc[5] : 0xFF);
+    } else {
+        int ok = hci_sync(h, OP_LE_SET_SCAN_PARAMS, scan, 7);
+        log_line("diag: LE scan parameters -> %s (status %#04x)", ok ? "accepted" : "refused",
+                 h->cc_op == OP_LE_SET_SCAN_PARAMS && h->cc_len > 5 ? h->cc[5] : 0xFF);
+    }
     /* Answered by an LE event; without it, pairing falls back to legacy. */
     send_cmd(h, OP_LE_READ_LOCAL_P256, NULL, 0);
 }
@@ -205,7 +244,8 @@ void le_shutdown(host_t *h)
     static const uint8_t off[2] = { 0, 0 };
 
     if (h->le_ok && h->le_scanning) {
-        hci_sync(h, OP_LE_SET_SCAN_ENABLE, off, 2);
+        (void)off;
+        scan_cmd(h, 0, 1);
         h->le_scanning = 0;
     }
 }
@@ -333,7 +373,8 @@ static void le_scan_off(host_t *h, link_t *l, long now)
 {
     static const uint8_t off[2] = { 0, 0 };
 
-    if (send_cmd(h, OP_LE_SET_SCAN_ENABLE, off, 2)) h->le_scan_out++;
+    (void)off;
+    if (scan_cmd(h, 0, 0)) h->le_scan_out++;
     h->le_scan_last = 0;
     h->le_scanning = 0;
     l->le_s.cstate = LC_SCAN_OFF;
@@ -358,7 +399,23 @@ static void le_create(host_t *h, link_t *l, long now)
     put16(p + 19, 200);                 /* supervision timeout 2 s */
     put16(p + 21, 0);
     put16(p + 23, 0);
-    send_cmd(h, OP_LE_CREATE_CONN, p, 25);
+    if (le_ext()) {
+        /* The same connection on the 1M PHY, in the extended layout:
+         * filter, own address type, peer type, peer, PHYs, then per PHY
+         * scan interval and window, then p[13..24] as above. */
+        uint8_t x[26];
+        x[0] = 0;
+        x[1] = 0;
+        x[2] = l->le_s.addr_type;
+        memcpy(x + 3, l->addr, 6);
+        x[9] = 0x01;
+        memcpy(x + 10, p, 4);
+        memcpy(x + 14, p + 13, 12);
+        send_cmd(h, OP_LE_EXT_CREATE_CONN, x, 26);
+        log_line("diag: extended create connection to %s", addr_str(l->addr));
+    } else {
+        send_cmd(h, OP_LE_CREATE_CONN, p, 25);
+    }
     l->le_s.cstate = LC_CREATING;
     l->le_s.t_cstate = now;
     l->t_create = now;
@@ -423,15 +480,17 @@ void le_on_cmd_complete(host_t *h, unsigned op, int status)
     link_t *l;
     long now = now_ms();
 
-    if (op == OP_LE_SET_SCAN_ENABLE) {
+    if (op == OP_LE_SET_SCAN_ENABLE || op == OP_LE_SET_EXT_SCAN_ENABLE) {
         if (h->le_scan_out > 0) h->le_scan_out--;
         l = le_connecting(h);
         if (l && l->le_s.cstate == LC_SCAN_OFF) {
             l->le_s.st_scan = status;
             if (h->le_scan_out == 0) le_create(h, l, now);
-        } else if (status != 0) {
-            LE_DIAG(h, "le: scan %s (0x200C) answered status %#04x",
-                    h->le_scan_last ? "on" : "off", status);
+        } else {
+            static int shown;
+            if (shown++ < 6)
+                log_line("diag: scan %s (0x200C) answered status %#04x",
+                         h->le_scan_last ? "on" : "off", status);
         }
     } else if (op == OP_LE_CREATE_CONN_CANCEL) {
         l = le_connecting(h);
@@ -513,12 +572,31 @@ static int looks_like_gamepad(const uint8_t *d, int n)
     return appearance || (hid && named);
 }
 
+/* Diagnostics for this console: how many advertisements arrive, and what
+ * the first few look like. */
+static long g_adv_n, g_adv_t;
+static int g_adv_logged;
+
 static void on_advert(host_t *h, const uint8_t *r, int n)
 {
     uint8_t evtype, type, dlen;
     const uint8_t *addr, *data;
     db_rec *bond;
     int i;
+    long now0 = now_ms();
+
+    g_adv_n++;
+    if (now0 - g_adv_t >= 5000) {
+        log_line("diag adv: %ld advertising report(s) in the last %ld ms", g_adv_n,
+                 g_adv_t ? now0 - g_adv_t : 0);
+        g_adv_n = 0;
+        g_adv_t = now0;
+    }
+    if (n >= 10 && g_adv_logged < 40) {
+        g_adv_logged++;
+        log_line("diag adv: type %u addr %s len %u gamepad %d", r[0], addr_str(r + 2), r[8],
+                 9 + r[8] <= n ? looks_like_gamepad(r + 9, r[8]) : -1);
+    }
 
     if (n < 10) return;
     evtype = r[0];
@@ -565,7 +643,7 @@ void le_poll(host_t *h, long now)
     if (want != h->le_scanning || (want && now - h->t_scan > T_SCAN_REFRESH)) {
         p[0] = (uint8_t)want;
         p[1] = 0;
-        if (send_cmd(h, OP_LE_SET_SCAN_ENABLE, p, 2)) h->le_scan_out++;
+        if (scan_cmd(h, p[0], 0)) h->le_scan_out++;
         h->le_scan_last = want;
         h->le_scanning = want;
         h->t_scan = now;
@@ -612,6 +690,38 @@ void le_on_meta(host_t *h, const unsigned char *ev, int len)
             log_line("le pad %s: connected, handle %#05x", addr_str(l->addr), l->handle);
         l->le_s.cstate = LC_NONE;
         break;
+
+    case 0x0D: { /* Extended Advertising Report */
+        /* Per report: event type (2), address type, address (6), PHYs (2),
+         * SID, TX power, RSSI, periodic interval (2), direct address type
+         * and address (7), data length, data. Rebuilt in the legacy form
+         * on_advert takes: type, address type, address, length, data. */
+        int nrep = len >= 2 ? ev[1] : 0, i, pos = 2;
+        static int shown;
+        if (shown++ < 3) log_line("diag: extended advertising report(s): %d", nrep);
+        for (i = 0; i < nrep && pos + 24 <= len; i++) {
+            const unsigned char *r = ev + pos;
+            unsigned et = r[0] | (r[1] << 8);
+            int dlen = r[23];
+            uint8_t rec[9 + 255];
+            if (pos + 24 + dlen > len) break;
+            /* Legacy-PDU bit set: map back to ADV_IND (0), ADV_DIRECT_IND
+             * (1), ADV_SCAN_IND (2), ADV_NONCONN_IND (3), SCAN_RSP (4).
+             * Extended connectable PDUs count as ADV_IND. */
+            if (et & 0x08)                rec[0] = 4;
+            else if ((et & 0x05) == 0x05) rec[0] = 1;
+            else if (et & 0x01)           rec[0] = 0;
+            else if (et & 0x02)           rec[0] = 2;
+            else                          rec[0] = 3;
+            rec[1] = r[2];
+            memcpy(rec + 2, r + 3, 6);
+            rec[8] = (uint8_t)dlen;
+            memcpy(rec + 9, r + 24, (size_t)dlen);
+            on_advert(h, rec, 9 + dlen);
+            pos += 24 + dlen;
+        }
+        break;
+    }
 
     case 0x02:  /* Advertising Report: one report per event, in practice */
         if (len >= 3 && ev[1] >= 1) on_advert(h, ev + 2, len - 2);
